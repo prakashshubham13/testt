@@ -17,10 +17,8 @@ import com.welhire.welhire_subscription_service.repository.HostedCheckoutReposit
 import com.welhire.welhire_subscription_service.repository.PlanPriceRepository;
 import com.welhire.welhire_subscription_service.repository.PricebookRepository;
 import com.welhire.welhire_subscription_service.repository.SubscriptionMasterPlanRepository;
-
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -38,7 +36,7 @@ import java.util.*;
 /**
  * Checkout flow:
  * - getBillingDetails()
- * - createHostedPage()
+ * - createHostedPage()  <-- now always upserts BillingEntity
  * - checkPaymentStatus()
  * - processPaymentWebhook() <-- provider → our service (source of truth)
  */
@@ -63,13 +61,13 @@ public class CheckoutService {
     // Provisioning service (creates subscription on SUCCESS; same-plan-only replacement)
     private final SubscriptionProvisioningService subscriptionProvisioningService;
 
-    // NEW: to map plan entity → PlanDtos.PlanView (sorted features, prices, etc.)
+    // Map plan entity → PlanDtos.PlanView (sorted features, prices, etc.)
     private final PlanService planService;
 
     private final ObjectMapper objectMapper;
 
     // Optional HMAC secret for Zoho webhook validation
-    @Value("${zoho.org.in.webhook.zohoSecret}")
+    @Value("${zoho.org.in.webhook.zohoSecret:}")
     private String zohoWebhookSecret;
 
     // ---------------------------------------------------------------------
@@ -140,7 +138,7 @@ public class CheckoutService {
     }
 
     // ---------------------------------------------------------------------
-    // /getHostedPage (gateway-agnostic; Zoho adapter today)
+    // /getHostedPage (gateway-agnostic; Zoho adapter today) — NOW UPSERTS BillingEntity
     // ---------------------------------------------------------------------
     @Transactional
     public GetHostedPageResponse createHostedPage(GetHostedPageRequest req) {
@@ -157,40 +155,37 @@ public class CheckoutService {
             throw new IllegalArgumentException("tenantId, billingId, planCode and currency are required");
         }
 
-        // 1.a) Fetch BillingEntity (ensures tenant+billing exists)
-        BillingEntity be = billingRepo.findByBillingIdAndTenantId(billingId, tenantId)
-                .orElseThrow(() -> new IllegalArgumentException(
-                        "BillingEntity not found for tenantId=" + tenantId + ", billingId=" + billingId));
-
         // 2) Resolve pricebook (currency -> pricebookId)
         Pricebook pb = pricebookRepo.findByCurrencyIgnoreCase(currency)
                 .orElseThrow(() -> new IllegalStateException("No pricebook configured for currency=" + currency));
         final String pricebookId = pb.getPricebookId();
 
-        // 3) Ensure plan exists, is ACTIVE, has price for this currency
+        // 3) Upsert BillingEntity (auto-create minimal if absent; keep pricebookId aligned)
+        BillingEntity be = upsertBillingEntityFromRequest(req, pricebookId);
+
+        // 4) Ensure plan exists, ACTIVE, and has a price for this currency
         SubscriptionMasterPlan plan = planRepo.findByExternalPlanCode(planCode)
                 .orElseThrow(() -> new IllegalArgumentException("Unknown planCode: " + planCode));
-
         if (!Boolean.TRUE.equals(plan.getIsActive())) {
             throw new IllegalStateException("Plan " + planCode + " is not active");
         }
 
-        // 3.a) Guard — no ACTIVE sub for this tenant/billing **for this SAME plan**
+        // 4.a) Guard — no ACTIVE sub for this tenant/billing **for this SAME plan**
         boolean hasActiveForThisPlan = billingSubRepo
                 .existsByBillingEntity_TenantIdAndBillingEntity_BillingIdAndPlan_IdAndStatus(
-                        tenantId, billingId, plan.getId(), SubscriptionStatus.ACTIVE);
-
+                        be.getTenantId(), be.getBillingId(), plan.getId(), SubscriptionStatus.ACTIVE);
         if (hasActiveForThisPlan) {
             throw new IllegalStateException(
                     "An ACTIVE subscription already exists for this tenant/billing on plan " + planCode
                             + ". Hosted checkout is not allowed.");
         }
 
+        // Check price availability (will also throw if missing)
         PlanPrice planPrice = priceRepo.findByPlanIdAndCurrency(plan.getId(), currency)
                 .orElseThrow(() -> new IllegalStateException(
                         "No plan price for planCode=" + planCode + " currency=" + currency));
 
-        // 4) Build provider request payload (generic map). IMPORTANT: do NOT include orgKey here.
+        // 5) Build provider request payload (generic map). IMPORTANT: do NOT include orgKey here.
         Map<String, Object> payload = new HashMap<>();
         payload.put("pricebook_id", pricebookId);
         payload.put("plan", Map.of("plan_code", planCode));
@@ -198,14 +193,10 @@ public class CheckoutService {
             payload.put("redirect_url", redirect);
         }
 
-        // 4.a) --- India GST must be at ROOT for Hosted Pages ---
-        final String gstNo = StringUtils.hasText(req.getGstNo()) ? req.getGstNo().trim() : null;
-        final String posFromReq = StringUtils.hasText(req.getGstStateCode())
-                ? req.getGstStateCode().trim().toUpperCase(Locale.ROOT)
-                : null;
-        final String posFallback = StringUtils.hasText(req.getBillStateCode())
-                ? req.getBillStateCode().trim().toUpperCase(Locale.ROOT)
-                : null;
+        // 5.a) India GST — must be at ROOT for Hosted Pages
+        final String gstNo = text(req.getGstNo());
+        final String posFromReq = text(req.getGstStateCode());
+        final String posFallback = text(req.getBillStateCode());
 
         if (StringUtils.hasText(gstNo)) {
             payload.put("gst_treatment", "business_gst");
@@ -219,13 +210,11 @@ public class CheckoutService {
             payload.put("place_of_supply", placeOfSupply); // e.g., "MH"
         }
 
-        // 4.b) Customer block
+        // 5.b) Customer block — linked vs new
         boolean linked = Boolean.TRUE.equals(req.getIsZohoLinked());
         if (linked && StringUtils.hasText(req.getZohoCustomerId())) {
-            // Linked flow
             payload.put("customer_id", req.getZohoCustomerId().trim());
         } else {
-            // New-customer flow
             Map<String, Object> cust = new HashMap<>();
             putIfText(cust, "display_name", req.getDisplayName());
             putIfText(cust, "first_name", req.getFirstName());
@@ -258,219 +247,12 @@ public class CheckoutService {
             putIfText(ship, "country", req.getShipCountry());
             putIfText(ship, "fax", req.getShipFax());
 
-            if (!bill.isEmpty())
-                cust.put("billing_address", bill);
-            if (!ship.isEmpty())
-                cust.put("shipping_address", ship);
+            if (!bill.isEmpty()) cust.put("billing_address", bill);
+            if (!ship.isEmpty()) cust.put("shipping_address", ship);
 
             // Keep pricebook on the customer for future orders (optional)
             cust.put("pricebook_id", pricebookId);
 
-            payload.put("customer", cust);
-        }
-
-        // 5) Persist HostedCheckout row (status=CREATED) for webhook correlation
-        String orderId = UUID.randomUUID().toString();
-        HostedCheckout hc = HostedCheckout.builder()
-                .orderId(orderId)
-                .gateway(gateway)
-                .tenantId(tenantId)
-                .billingId(billingId)
-                .planCode(planCode)
-                .currency(currency)
-                .pricebookId(pricebookId)
-                .status("CREATED")
-                .redirectUrl(redirect)
-                .requestPayloadJson(writeJsonSafe(payload))
-                .build();
-        hostedRepo.saveAndFlush(hc);
-
-        // 6) Call selected gateway (Zoho adapter today)
-        PaymentGateway gw = gatewayRegistry.resolve(gateway);
-        PaymentGateway.HostedPageResult res = gw.createHostedPage(payload);
-
-        // 7) Update HostedCheckout with provider details; mark PENDING
-        hc.setProviderHostedpageId(res.hostedpageId());
-        hc.setProviderDecryptedHostedpageId(res.decryptedHostedpageId());
-        hc.setProviderStatus(res.status());
-        hc.setHostedUrl(res.url());
-        hc.setStatus("PENDING");
-        hc.setResponsePayloadJson(res.rawResponseJson());
-        if (res.expiringTime() != null) {
-            hc.setExpiringTime(parseZohoTimeSafe(res.expiringTime())); // tolerant parser
-        }
-        hostedRepo.save(hc);
-
-        // 8) Return to client
-        return GetHostedPageResponse.builder()
-                .orderId(orderId)
-                .gateway(gateway)
-                .hostedpageId(res.hostedpageId())
-                .url(res.url())
-                .status(res.status())
-                .expiringTime(res.expiringTime())
-                .build();
-    }
-
-    @Transactional
-    public GetHostedPageResponse createHostedPageModified(GetHostedPageRequest req) {
-        // 1) Normalize & validate
-        final String tenantId = trim(req.getTenantId());
-        final String billingId = trim(req.getBillingId());
-        final String planCode = trim(req.getPlanCode());
-        final String currency = trim(req.getCurrency()).toUpperCase(Locale.ROOT);
-        final String gateway = StringUtils.hasText(req.getGateway()) ? req.getGateway().trim() : "ZOHOBILLING";
-        final String redirect = trim(req.getRedirectUrl());
-
-        if (!StringUtils.hasText(tenantId) || !StringUtils.hasText(billingId) ||
-                !StringUtils.hasText(planCode) || !StringUtils.hasText(currency)) {
-            throw new IllegalArgumentException("tenantId, billingId, planCode and currency are required");
-        }
-
-        // 2) Resolve pricebook (currency -> pricebookId)
-        Pricebook pb = pricebookRepo.findByCurrencyIgnoreCase(currency)
-                .orElseThrow(() -> new IllegalStateException("No pricebook configured for currency=" + currency));
-        final String pricebookId = pb.getPricebookId();
-
-        // 3) Upsert BillingEntity (auto-create minimal if absent)
-        BillingEntity be = billingRepo.findByBillingIdAndTenantId(billingId, tenantId).orElse(null);
-        if (be == null) {
-            final String beName = StringUtils.hasText(req.getCompanyName()) ? req.getCompanyName().trim()
-                    : (StringUtils.hasText(req.getDisplayName()) ? req.getDisplayName().trim()
-                    : ("Tenant " + tenantId));
-
-            final String billStreet = trim(req.getBillStreet());
-            final String billCity = trim(req.getBillCity());
-            final String billZip = trim(req.getBillZip());
-            final String billCountry = trim(req.getBillCountry());
-            final String derivedAddr = String.join(", ",
-                    new ArrayList<>(Arrays.asList(billStreet, billCity, billZip, billCountry)).stream()
-                            .filter(StringUtils::hasText).toList());
-
-            be = BillingEntity.builder()
-                    .tenantId(tenantId)
-                    .billingId(billingId)
-                    .name(beName)
-                    .email(trim(req.getEmail()))
-                    .mobile(trim(req.getMobile()))
-                    .fname(trim(req.getFirstName()))
-                    .lname(trim(req.getLastName()))
-                    .billingAddress(derivedAddr)
-                    .stateName(trim(req.getBillState()))
-                    .stateCode(trim(req.getBillStateCode()))
-                    .gstNumber(trim(req.getGstNo()))
-                    .gstStateCode(trim(req.getGstStateCode()))
-                    .isZohoLinked(Boolean.FALSE)
-                    .hasCompleteBillingProfile(Boolean.FALSE)
-                    .pricebookId(pricebookId)
-                    .build();
-
-            try {
-                be = billingRepo.saveAndFlush(be);
-            } catch (org.springframework.dao.DataIntegrityViolationException dup) {
-                // race: another request created it; re-fetch
-                be = billingRepo.findByBillingIdAndTenantId(billingId, tenantId)
-                        .orElseThrow(() -> new IllegalStateException("BillingEntity upsert race failed; please retry"));
-            }
-        } else {
-            // Optionally keep pricebookId aligned to chosen currency if empty
-            if (!StringUtils.hasText(be.getPricebookId())) {
-                be.setPricebookId(pricebookId);
-                billingRepo.save(be);
-            }
-        }
-
-        // 4) Ensure plan exists, ACTIVE, and has a price for this currency
-        SubscriptionMasterPlan plan = planRepo.findByExternalPlanCode(planCode)
-                .orElseThrow(() -> new IllegalArgumentException("Unknown planCode: " + planCode));
-        if (!Boolean.TRUE.equals(plan.getIsActive())) {
-            throw new IllegalStateException("Plan " + planCode + " is not active");
-        }
-
-        // 4.a) Guard — no ACTIVE sub for this tenant/billing **for this SAME plan**
-        boolean hasActiveForThisPlan = billingSubRepo
-                .existsByBillingEntity_TenantIdAndBillingEntity_BillingIdAndPlan_IdAndStatus(
-                        tenantId, billingId, plan.getId(), SubscriptionStatus.ACTIVE);
-        if (hasActiveForThisPlan) {
-            throw new IllegalStateException(
-                    "An ACTIVE subscription already exists for this tenant/billing on plan " + planCode
-                            + ". Hosted checkout is not allowed.");
-        }
-
-        PlanPrice planPrice = priceRepo.findByPlanIdAndCurrency(plan.getId(), currency)
-                .orElseThrow(() -> new IllegalStateException(
-                        "No plan price for planCode=" + planCode + " currency=" + currency));
-
-        // 5) Build provider request payload (generic map) – do NOT include org key here
-        Map<String, Object> payload = new HashMap<>();
-        payload.put("pricebook_id", pricebookId);
-        payload.put("plan", Map.of("plan_code", planCode));
-        if (StringUtils.hasText(redirect)) {
-            payload.put("redirect_url", redirect);
-        }
-
-        // 5.a) India GST at ROOT
-        final String gstNo = StringUtils.hasText(req.getGstNo()) ? req.getGstNo().trim() : null;
-        final String posFromReq = StringUtils.hasText(req.getGstStateCode())
-                ? req.getGstStateCode().trim().toUpperCase(Locale.ROOT)
-                : null;
-        final String posFallback = StringUtils.hasText(req.getBillStateCode())
-                ? req.getBillStateCode().trim().toUpperCase(Locale.ROOT)
-                : null;
-
-        if (StringUtils.hasText(gstNo)) {
-            payload.put("gst_treatment", "business_gst");
-            payload.put("gst_no", gstNo);
-        } else {
-            payload.put("gst_treatment", "consumer");
-        }
-
-        String placeOfSupply = StringUtils.hasText(posFromReq) ? posFromReq : posFallback;
-        if (StringUtils.hasText(placeOfSupply)) {
-            payload.put("place_of_supply", placeOfSupply); // e.g., "MH"
-        }
-
-        // 5.b) Customer block – linked vs new
-        boolean linked2 = Boolean.TRUE.equals(req.getIsZohoLinked());
-        if (linked2 && StringUtils.hasText(req.getZohoCustomerId())) {
-            payload.put("customer_id", req.getZohoCustomerId().trim());
-        } else {
-            Map<String, Object> cust = new HashMap<>();
-            putIfText(cust, "display_name", req.getDisplayName());
-            putIfText(cust, "first_name", req.getFirstName());
-            putIfText(cust, "last_name", req.getLastName());
-            putIfText(cust, "email", req.getEmail());
-            putIfText(cust, "phone", req.getPhone());
-            putIfText(cust, "mobile", req.getMobile());
-            putIfText(cust, "company_name", req.getCompanyName());
-            putIfText(cust, "website", req.getWebsite());
-
-            Map<String, Object> bill = new HashMap<>();
-            putIfText(bill, "attention", req.getBillAttention());
-            putIfText(bill, "street", req.getBillStreet());
-            putIfText(bill, "city", req.getBillCity());
-            putIfText(bill, "state", req.getBillState());
-            putIfText(bill, "state_code", req.getBillStateCode());
-            putIfText(bill, "zip", req.getBillZip());
-            putIfText(bill, "country", req.getBillCountry());
-            putIfText(bill, "fax", req.getBillFax());
-
-            Map<String, Object> ship = new HashMap<>();
-            putIfText(ship, "attention", req.getShipAttention());
-            putIfText(ship, "street", req.getShipStreet());
-            putIfText(ship, "city", req.getShipCity());
-            putIfText(ship, "state", req.getShipState());
-            putIfText(ship, "state_code", req.getShipStateCode());
-            putIfText(ship, "zip", req.getShipZip());
-            putIfText(ship, "country", req.getShipCountry());
-            putIfText(ship, "fax", req.getShipFax());
-
-            if (!bill.isEmpty())
-                cust.put("billing_address", bill);
-            if (!ship.isEmpty())
-                cust.put("shipping_address", ship);
-
-            cust.put("pricebook_id", pricebookId);
             payload.put("customer", cust);
         }
 
@@ -479,8 +261,8 @@ public class CheckoutService {
         HostedCheckout hc = HostedCheckout.builder()
                 .orderId(orderId)
                 .gateway(gateway)
-                .tenantId(tenantId)
-                .billingId(billingId)
+                .tenantId(be.getTenantId())
+                .billingId(be.getBillingId())
                 .planCode(planCode)
                 .currency(currency)
                 .pricebookId(pricebookId)
@@ -538,10 +320,6 @@ public class CheckoutService {
         if (boundSub != null && boundSub.getPlan() != null) {
             planView = planService.toDto(boundSub.getPlan());
         } else if (StringUtils.hasText(hc.getPlanCode())) {
-            planRepo.findByExternalPlanCodeAndIsActiveTrue(hc.getPlanCode())
-                    .ifPresent(p -> {
-                        // applied below after optional provisioning to avoid shadowing a just-created sub
-                    });
             var opt = planRepo.findByExternalPlanCodeAndIsActiveTrue(hc.getPlanCode());
             if (opt.isPresent()) {
                 planView = planService.toDto(opt.get());
@@ -551,10 +329,8 @@ public class CheckoutService {
         // Fast path: terminal local state → no provider call
         PaymentStatus local = mapHostedCheckoutToPaymentStatus(hc.getStatus());
         if (local == PaymentStatus.SUCCESS || local == PaymentStatus.FAILED || local == PaymentStatus.EXPIRED) {
-            // If SUCCESS and not yet provisioned (e.g., webhook delayed), provisioning is safe (idempotent)
             if (local == PaymentStatus.SUCCESS) {
-                safeProvision(hc);
-                // refresh sub after provisioning
+                safeProvision(hc); // idempotent
                 boundSub = billingSubRepo.findByActivationOrderId(orderId).orElse(boundSub);
                 if (boundSub != null && boundSub.getPlan() != null) {
                     planView = planService.toDto(boundSub.getPlan());
@@ -601,8 +377,7 @@ public class CheckoutService {
 
         // Persist snapshot for later quick responses / audit
         hc.setProviderStatus(result.status());
-        if (StringUtils.hasText(result.url()))
-            hc.setHostedUrl(result.url());
+        if (StringUtils.hasText(result.url())) hc.setHostedUrl(result.url());
         if (StringUtils.hasText(result.expiringTime())) {
             hc.setExpiringTime(parseZohoTimeSafe(result.expiringTime()));
         }
@@ -645,10 +420,7 @@ public class CheckoutService {
     }
 
     /**
-     * Local-only payment status check.
-     * - Does NOT call provider.
-     * - Uses our HostedCheckout row only.
-     * - If local status == SUCCESS, triggers idempotent provisioning.
+     * Local-only payment status check (no provider call). If local is SUCCESS, still provisions idempotently.
      */
     @Transactional
     public CheckPaymentStatusResponse checkPaymentStatusLocalOnly(CheckPaymentStatusRequest req) {
@@ -658,12 +430,10 @@ public class CheckoutService {
         HostedCheckout hc = hostedRepo.findByOrderId(orderId)
                 .orElseThrow(() -> new IllegalArgumentException("Unknown orderId"));
 
-        // Optional enforcement: ensure request gateway matches persisted gateway
         if (StringUtils.hasText(hc.getGateway()) && !hc.getGateway().equalsIgnoreCase(gateway)) {
             throw new IllegalArgumentException("Gateway mismatch for this orderId");
         }
 
-        // Prepare plan details from either bound subscription or requested planCode
         PlanDtos.PlanView planView = null;
         BillingEntitySubscription boundSub = billingSubRepo.findByActivationOrderId(orderId).orElse(null);
         if (boundSub != null && boundSub.getPlan() != null) {
@@ -675,10 +445,8 @@ public class CheckoutService {
             }
         }
 
-        // Map LOCAL status only (no live provider call)
         PaymentStatus local = mapHostedCheckoutToPaymentStatus(hc.getStatus());
 
-        // If terminal, return immediately; also provision on SUCCESS (idempotent)
         if (local == PaymentStatus.SUCCESS || local == PaymentStatus.FAILED || local == PaymentStatus.EXPIRED) {
             if (local == PaymentStatus.SUCCESS) {
                 safeProvision(hc);
@@ -706,7 +474,6 @@ public class CheckoutService {
                     .build();
         }
 
-        // Not terminal yet → report as PENDING/UNKNOWN based on local info
         PaymentStatus pendingish = (local == PaymentStatus.UNKNOWN) ? PaymentStatus.UNKNOWN : PaymentStatus.PENDING;
 
         return CheckPaymentStatusResponse.builder()
@@ -794,9 +561,8 @@ public class CheckoutService {
         if (current == PaymentStatus.SUCCESS || current == PaymentStatus.FAILED || current == PaymentStatus.EXPIRED) {
             appendProviderPayload(hc, rawBody);
             hostedRepo.save(hc);
-            // If SUCCESS and provisioning was missed earlier, call safely (idempotent)
             if (current == PaymentStatus.SUCCESS) {
-                safeProvision(hc);
+                safeProvision(hc); // idempotent
             }
             return WebhookResult.builder()
                     .accepted(true)
@@ -817,8 +583,7 @@ public class CheckoutService {
         // --- Capture / compare hosted_page_id (prefer payment payload) ---
         String hostedpageIdFromPayment = isZohoPaymentPayload(root) ? extractHostedpageIdFromPayment(root) : null;
         String hostedpageIdGeneric = extractHostedpageId(root);
-        String hostedpageIdObserved = StringUtils.hasText(hostedpageIdFromPayment) ? hostedpageIdFromPayment
-                : hostedpageIdGeneric;
+        String hostedpageIdObserved = StringUtils.hasText(hostedpageIdFromPayment) ? hostedpageIdFromPayment : hostedpageIdGeneric;
 
         if (StringUtils.hasText(hostedpageIdObserved)) {
             if (!StringUtils.hasText(hc.getProviderDecryptedHostedpageId())) {
@@ -874,12 +639,86 @@ public class CheckoutService {
             String message,
             String orderId,
             String provider,
-            PaymentStatus normalizedStatus) {
-    }
+            PaymentStatus normalizedStatus) {}
 
     // ---------------------------------------------------------------------
     // helpers
     // ---------------------------------------------------------------------
+
+    /** Upserts BillingEntity from the hosted-page request and ensures pricebook linkage. */
+    private BillingEntity upsertBillingEntityFromRequest(GetHostedPageRequest req, String pricebookId) {
+        final String tenantId = trim(req.getTenantId());
+        final String billingId = trim(req.getBillingId());
+
+        BillingEntity be = billingRepo.findByBillingIdAndTenantId(billingId, tenantId).orElse(null);
+        if (be == null) {
+            // Derive a human-friendly name if possible
+            final String derivedName =
+                    StringUtils.hasText(req.getCompanyName()) ? req.getCompanyName().trim()
+                    : (StringUtils.hasText(req.getDisplayName()) ? req.getDisplayName().trim()
+                    : ("Tenant " + tenantId));
+
+            // Derive 1-line address (street, city, zip, country)
+            final String addr = joinNonBlank(", ",
+                    text(req.getBillStreet()),
+                    text(req.getBillCity()),
+                    text(req.getBillZip()),
+                    text(req.getBillCountry()));
+
+            be = BillingEntity.builder()
+                    .tenantId(tenantId)
+                    .billingId(billingId)
+                    .name(derivedName)
+                    .email(text(req.getEmail()))
+                    .mobile(text(req.getMobile()))
+                    .fname(text(req.getFirstName()))
+                    .lname(text(req.getLastName()))
+                    .billingAddress(addr)
+                    .stateName(text(req.getBillState()))
+                    .stateCode(text(req.getBillStateCode()))
+                    .gstNumber(text(req.getGstNo()))
+                    .gstStateCode(text(req.getGstStateCode()))
+                    .isZohoLinked(Boolean.FALSE)            // until you mark linkage elsewhere
+                    .hasCompleteBillingProfile(Boolean.FALSE) // we only have minimal info here
+                    .pricebookId(pricebookId)
+                    .build();
+
+            try {
+                be = billingRepo.saveAndFlush(be);
+            } catch (org.springframework.dao.DataIntegrityViolationException dup) {
+                // race: another request created it; re-fetch
+                be = billingRepo.findByBillingIdAndTenantId(billingId, tenantId)
+                        .orElseThrow(() -> new IllegalStateException("BillingEntity upsert race failed; please retry"));
+            }
+        } else {
+            // Keep/set pricebook alignment if not set
+            if (!StringUtils.hasText(be.getPricebookId())) {
+                be.setPricebookId(pricebookId);
+            }
+            // Opportunistic enrichment (do not overwrite existing non-blank fields)
+            be.setName(firstNonBlank(be.getName(), req.getCompanyName(), req.getDisplayName(), "Tenant " + tenantId));
+            be.setEmail(firstNonBlank(be.getEmail(), req.getEmail()));
+            be.setMobile(firstNonBlank(be.getMobile(), req.getMobile()));
+            be.setFname(firstNonBlank(be.getFname(), req.getFirstName()));
+            be.setLname(firstNonBlank(be.getLname(), req.getLastName()));
+            be.setStateName(firstNonBlank(be.getStateName(), req.getBillState()));
+            be.setStateCode(firstNonBlank(be.getStateCode(), req.getBillStateCode()));
+            be.setGstNumber(firstNonBlank(be.getGstNumber(), req.getGstNo()));
+            be.setGstStateCode(firstNonBlank(be.getGstStateCode(), req.getGstStateCode()));
+
+            final String currentAddr = StringUtils.hasText(be.getBillingAddress()) ? be.getBillingAddress() : null;
+            final String newAddr = joinNonBlank(", ",
+                    text(req.getBillStreet()),
+                    text(req.getBillCity()),
+                    text(req.getBillZip()),
+                    text(req.getBillCountry()));
+            if (!StringUtils.hasText(currentAddr) && StringUtils.hasText(newAddr)) {
+                be.setBillingAddress(newAddr);
+            }
+            billingRepo.save(be);
+        }
+        return be;
+    }
 
     private void safeProvision(HostedCheckout hc) {
         try {
@@ -893,9 +732,31 @@ public class CheckoutService {
         return (s == null) ? null : s.trim();
     }
 
+    private String text(String s) {
+        return StringUtils.hasText(s) ? s.trim() : null;
+    }
+
+    private String firstNonBlank(String current, String... candidates) {
+        if (StringUtils.hasText(current)) return current;
+        for (String c : candidates) {
+            if (StringUtils.hasText(c)) return c.trim();
+        }
+        return current;
+    }
+
+    private String joinNonBlank(String sep, String... parts) {
+        StringBuilder sb = new StringBuilder();
+        for (String p : parts) {
+            if (StringUtils.hasText(p)) {
+                if (sb.length() > 0) sb.append(sep);
+                sb.append(p.trim());
+            }
+        }
+        return sb.toString();
+    }
+
     private void putIfText(Map<String, Object> map, String k, String v) {
-        if (StringUtils.hasText(v))
-            map.put(k, v.trim());
+        if (StringUtils.hasText(v)) map.put(k, v.trim());
     }
 
     private String writeJsonSafe(Object o) {
@@ -912,8 +773,7 @@ public class CheckoutService {
      */
     private OffsetDateTime parseZohoTimeSafe(String s) {
         try {
-            if (s == null)
-                return null;
+            if (s == null) return null;
             DateTimeFormatter f = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ssZ");
             return OffsetDateTime.parse(s, f);
         } catch (Exception e) {
@@ -923,8 +783,7 @@ public class CheckoutService {
     }
 
     private PaymentStatus mapHostedCheckoutToPaymentStatus(String local) {
-        if (local == null)
-            return PaymentStatus.UNKNOWN;
+        if (local == null) return PaymentStatus.UNKNOWN;
         return switch (local.toUpperCase(Locale.ROOT)) {
             case "CREATED", "PENDING" -> PaymentStatus.PENDING;
             case "COMPLETED", "PAID" -> PaymentStatus.SUCCESS;
@@ -936,8 +795,7 @@ public class CheckoutService {
 
     /** Provider hostedpage.status / payment.status → normalized */
     private PaymentStatus mapProviderStatus(String provider) {
-        if (provider == null)
-            return PaymentStatus.UNKNOWN;
+        if (provider == null) return PaymentStatus.UNKNOWN;
         return switch (provider.toLowerCase(Locale.ROOT)) {
             case "success", "paid", "completed", "used" -> PaymentStatus.SUCCESS;
             case "expired" -> PaymentStatus.EXPIRED;
@@ -951,10 +809,8 @@ public class CheckoutService {
 
     private boolean validateZohoSignature(MultiValueMap<String, String> headers, String body, String secret) {
         String provided = headerFirst(headers, "X-Zoho-Webhook-Signature");
-        if (!StringUtils.hasText(provided))
-            provided = headerFirst(headers, "x-zoho-webhook-signature");
-        if (!StringUtils.hasText(provided))
-            return false;
+        if (!StringUtils.hasText(provided)) provided = headerFirst(headers, "x-zoho-webhook-signature");
+        if (!StringUtils.hasText(provided)) return false;
 
         try {
             Mac mac = Mac.getInstance("HmacSHA256");
@@ -977,15 +833,13 @@ public class CheckoutService {
         Map<String, Object> root = parseJsonSafely(rawBody);
         if (root != null && isZohoPaymentPayload(root)) {
             String fromPayment = extractProviderFromPayment(root);
-            if (StringUtils.hasText(fromPayment))
-                return fromPayment;
+            if (StringUtils.hasText(fromPayment)) return fromPayment;
         }
         return StringUtils.hasText(fromHeader) ? fromHeader : "ZOHOBILLING";
     }
 
     private String headerFirst(MultiValueMap<String, String> headers, String key) {
-        if (headers == null || key == null)
-            return null;
+        if (headers == null || key == null) return null;
         var list = headers.get(key);
         return (list == null || list.isEmpty()) ? null : list.get(0);
     }
@@ -1001,55 +855,39 @@ public class CheckoutService {
     }
 
     private String extractHostedpageId(Map<String, Object> root) {
-        // payment payload first
         String id = extractHostedpageIdFromPayment(root);
-        if (!StringUtils.hasText(id))
-            id = tryExtract(root, "data.hostedpage.hostedpage_id");
-        if (!StringUtils.hasText(id))
-            id = tryExtract(root, "data.hostedpage.id");
-        if (!StringUtils.hasText(id))
-            id = tryExtract(root, "hostedpage_id");
-        if (!StringUtils.hasText(id))
-            id = tryExtract(root, "hostedpage.id");
+        if (!StringUtils.hasText(id)) id = tryExtract(root, "data.hostedpage.hostedpage_id");
+        if (!StringUtils.hasText(id)) id = tryExtract(root, "data.hostedpage.id");
+        if (!StringUtils.hasText(id)) id = tryExtract(root, "hostedpage_id");
+        if (!StringUtils.hasText(id)) id = tryExtract(root, "hostedpage.id");
         return id;
     }
 
     private String extractProviderStatus(Map<String, Object> root) {
-        // payment payload first
         String s = extractProviderStatusFromPayment(root);
-        if (!StringUtils.hasText(s))
-            s = tryExtract(root, "data.hostedpage.status");
-        if (!StringUtils.hasText(s))
-            s = tryExtract(root, "hostedpage.status");
-        if (!StringUtils.hasText(s))
-            s = tryExtract(root, "status");
+        if (!StringUtils.hasText(s)) s = tryExtract(root, "data.hostedpage.status");
+        if (!StringUtils.hasText(s)) s = tryExtract(root, "hostedpage.status");
+        if (!StringUtils.hasText(s)) s = tryExtract(root, "status");
         return s;
     }
 
     private String extractOrderId(Map<String, Object> root) {
-        // Prefer reference_id you include while creating the hosted page, or any order id you pass along
         String s = tryExtract(root, "data.hostedpage.reference_id");
-        if (!StringUtils.hasText(s))
-            s = tryExtract(root, "hostedpage.reference_id");
-        if (!StringUtils.hasText(s))
-            s = tryExtract(root, "orderId");
-        if (!StringUtils.hasText(s))
-            s = tryExtract(root, "data.order_id");
+        if (!StringUtils.hasText(s)) s = tryExtract(root, "hostedpage.reference_id");
+        if (!StringUtils.hasText(s)) s = tryExtract(root, "orderId");
+        if (!StringUtils.hasText(s)) s = tryExtract(root, "data.order_id");
         return s;
     }
 
     @SuppressWarnings("unchecked")
     private String tryExtract(Object node, String path) {
-        if (!(node instanceof Map))
-            return null;
+        if (!(node instanceof Map)) return null;
         String[] parts = path.split("\\.");
         Object cur = node;
         for (String p : parts) {
-            if (!(cur instanceof Map))
-                return null;
+            if (!(cur instanceof Map)) return null;
             cur = ((Map<String, Object>) cur).get(p);
-            if (cur == null)
-                return null;
+            if (cur == null) return null;
         }
         return (cur instanceof String) ? (String) cur : String.valueOf(cur);
     }
@@ -1069,14 +907,12 @@ public class CheckoutService {
 
     private String bytesToHex(byte[] bytes) {
         StringBuilder sb = new StringBuilder(bytes.length * 2);
-        for (byte b : bytes)
-            sb.append(String.format("%02x", b));
+        for (byte b : bytes) sb.append(String.format("%02x", b));
         return sb.toString();
     }
 
     private String redact(String in) {
-        if (in == null)
-            return "";
+        if (in == null) return "";
         return in.length() > 4000 ? in.substring(0, 4000) + "...(truncated)" : in;
     }
 
@@ -1097,11 +933,9 @@ public class CheckoutService {
     private String extractHostedpageIdFromPayment(Map<String, Object> root) {
         Map<String, Object> p = getPayment(root);
         Object invoices = p.get("invoices");
-        if (!(invoices instanceof List<?> list) || list.isEmpty())
-            return null;
+        if (!(invoices instanceof List<?> list) || list.isEmpty()) return null;
         Object first = list.get(0);
-        if (!(first instanceof Map<?, ?> m))
-            return null;
+        if (!(first instanceof Map<?, ?> m)) return null;
         Object v = ((Map<String, Object>) m).get("hosted_page_id");
         return (v == null) ? null : String.valueOf(v);
     }
@@ -1109,16 +943,14 @@ public class CheckoutService {
     private String extractProviderStatusFromPayment(Map<String, Object> root) {
         Map<String, Object> p = getPayment(root);
         String s = asText(p.get("payment_status")); // "paid"
-        if (!StringUtils.hasText(s))
-            s = asText(p.get("status")); // often "success"
+        if (!StringUtils.hasText(s)) s = asText(p.get("status")); // often "success"
         return s;
     }
 
     private String extractProviderFromPayment(Map<String, Object> root) {
         Map<String, Object> p = getPayment(root);
         String v = asText(tryGet(p, "autotransaction", "payment_gateway")); // "test_gateway"
-        if (!StringUtils.hasText(v))
-            v = asText(p.get("payment_mode"));
+        if (!StringUtils.hasText(v)) v = asText(p.get("payment_mode"));
         return v;
     }
 
@@ -1126,11 +958,9 @@ public class CheckoutService {
     private String extractZohoSubscriptionIdFromPayment(Map<String, Object> root) {
         Map<String, Object> p = getPayment(root);
         Object invoices = p.get("invoices");
-        if (!(invoices instanceof List<?> list) || list.isEmpty())
-            return null;
+        if (!(invoices instanceof List<?> list) || list.isEmpty()) return null;
         Object first = list.get(0);
-        if (!(first instanceof Map<?, ?> m))
-            return null;
+        if (!(first instanceof Map<?, ?> m)) return null;
         Object subs = ((Map<String, Object>) m).get("subscription_ids");
         if (subs instanceof List<?> l && !l.isEmpty()) {
             Object id0 = l.get(0);
@@ -1146,8 +976,7 @@ public class CheckoutService {
     @SuppressWarnings("unchecked")
     private Object tryGet(Map<String, Object> map, String key, String nestedKey) {
         Object inner = map.get(key);
-        if (!(inner instanceof Map))
-            return null;
+        if (!(inner instanceof Map)) return null;
         return ((Map<String, Object>) inner).get(nestedKey);
     }
 
@@ -1156,8 +985,7 @@ public class CheckoutService {
      * call it reflectively; else no-op.
      */
     private void setZohoSubscriptionIdIfPresent(HostedCheckout hc, String id) {
-        if (!StringUtils.hasText(id) || hc == null)
-            return;
+        if (!StringUtils.hasText(id) || hc == null) return;
         try {
             Method m = hc.getClass().getMethod("setZohoSubscriptionId", String.class);
             m.invoke(hc, id);
