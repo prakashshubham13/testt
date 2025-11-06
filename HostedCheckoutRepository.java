@@ -2,7 +2,10 @@ package com.welhire.welhire_subscription_service.repository;
 
 import com.welhire.welhire_subscription_service.entity.HostedCheckout;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 
@@ -13,4 +16,10 @@ public interface HostedCheckoutRepository extends JpaRepository<HostedCheckout, 
     Optional<HostedCheckout> findFirstByProviderDecryptedHostedpageId(String providerDecryptedHostedpageId);
     List<HostedCheckout> findAllByTenantIdAndBillingIdOrderByCreatedAtDesc(String tenantId, String billingId);
 
+    Page<HostedCheckout> findByTenantIdAndBillingIdAndStatusIn(
+            String tenantId,
+            String billingId,
+            Collection<String> statuses,
+            Pageable pageable
+    );
 }
